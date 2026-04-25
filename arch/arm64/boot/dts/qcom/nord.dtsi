@@ -1375,37 +1375,6 @@
 			};
 		};
 
-		qupv3_3: geniqup@cc0000 {
-			reg = <0x0 0x00cc0000 0x0 0x2000>;
-			#address-cells = <2>;
-			#size-cells = <2>;
-			iommus = <&apps_smmu_2 0x1063 0x0>;
-			ranges;
-
-			status = "disabled";
-
-			i2c21: i2c@c80000 {
-				reg = <0x0 0x00c80000 0x0 0x4000>;
-				interrupts = <GIC_SPI 312 IRQ_TYPE_LEVEL_HIGH>;
-
-				status = "disabled";
-			};
-
-			spi21: spi@c80000 {
-				reg = <0x0 0x00c80000 0x0 0x4000>;
-				interrupts = <GIC_SPI 312 IRQ_TYPE_LEVEL_HIGH>;
-
-				status = "disabled";
-			};
-
-			uart21: serial@c80000 {
-				reg = <0x0 0x00c80000 0x0 0x4000>;
-				interrupts = <GIC_SPI 312 IRQ_TYPE_LEVEL_HIGH>;
-
-				status = "disabled";
-			};
-		};
-
 		rng: rng@10c3000 {
 			compatible = "qcom,nord-trng",
 				     "qcom,trng";
