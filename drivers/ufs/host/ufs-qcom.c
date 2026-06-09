@@ -306,6 +306,15 @@ static int ufs_qcom_ice_prepare_key(struct blk_crypto_profile *profile,
 	return qcom_ice_prepare_key(host->ice, lt_key, lt_key_size, eph_key);
 }
 
+static int ufs_qcom_ice_scale_clk(struct ufs_qcom_host *host, unsigned long target_freq,
+				  bool round_ceil)
+{
+	if (host->hba->caps & UFSHCD_CAP_CRYPTO)
+		return qcom_ice_scale_clk(host->ice, target_freq, round_ceil);
+
+	return 0;
+}
+
 static const struct blk_crypto_ll_ops ufs_qcom_crypto_ops = {
 	.keyslot_program	= ufs_qcom_ice_keyslot_program,
 	.keyslot_evict		= ufs_qcom_ice_keyslot_evict,
@@ -338,6 +347,12 @@ static inline int ufs_qcom_ice_suspend(struct ufs_qcom_host *host)
 
 static void ufs_qcom_config_ice_allocator(struct ufs_qcom_host *host)
 {
+}
+
+static int ufs_qcom_ice_scale_clk(struct ufs_qcom_host *host, unsigned long target_freq,
+				  bool round_ceil)
+{
+	return 0;
 }
 
 #endif
@@ -760,9 +775,17 @@ static int ufs_qcom_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op,
 	if (!ufs_qcom_is_link_active(hba))
 		ufs_qcom_disable_lane_clks(host);
 
-
-	/* reset the connected UFS device during power down */
-	if (ufs_qcom_is_link_off(hba) && host->device_reset) {
+	/*
+	 * For some UFS vendors, skip asserting device reset here.
+	 * These vendor parts keep drawing larger current after reset
+	 * is asserted until it is deasserted, and the 10ms delay is
+	 * not sufficient to prevent OCP (Over Current Protection)
+	 * on the regulator. This is for the powerdown case, so
+	 * the device reset can be asserted later as part of the
+	 * platform shutdown sequence.
+	 */
+	if (ufs_qcom_is_link_off(hba) && host->device_reset &&
+	    !(hba->quirks & UFSHCD_QUIRK_SKIP_DEVICE_RESET)) {
 		ufs_qcom_device_reset_ctrl(hba, true);
 		/*
 		 * After sending the SSU command, asserting the rst_n
@@ -1278,6 +1301,19 @@ static struct ufs_dev_quirk ufs_qcom_dev_fixups[] = {
 static void ufs_qcom_fixup_dev_quirks(struct ufs_hba *hba)
 {
 	ufshcd_fixup_dev_quirks(hba, ufs_qcom_dev_fixups);
+
+	/*
+	 * Some UFS parts keep drawing larger current after reset is asserted
+	 * until it is deasserted. The 10ms delay added after asserting HWRST
+	 * (as done for other vendors) is not sufficient for these parts.
+	 *
+	 * Skip asserting device reset during UFS power down for these parts
+	 * to prevent OCP (Over Current Protection) fault on the regulator.
+	 * This is handled only in shutdown; the device reset will be asserted
+	 * as part of the platform shutdown sequence.
+	 */
+	if (hba->dev_info.wmanufacturerid == UFS_VENDOR_MICRON)
+		hba->quirks |= UFSHCD_QUIRK_SKIP_DEVICE_RESET;
 }
 
 static u32 ufs_qcom_get_ufs_hci_version(struct ufs_hba *hba)
@@ -1927,8 +1963,13 @@ static int ufs_qcom_clk_scale_notify(struct ufs_hba *hba, bool scale_up,
 		else
 			err = ufs_qcom_clk_scale_down_post_change(hba, target_freq);
 
-
 		if (err) {
+			ufshcd_uic_hibern8_exit(hba);
+			return err;
+		}
+
+		err = ufs_qcom_ice_scale_clk(host, target_freq, !scale_up);
+		if (err && err != -EOPNOTSUPP) {
 			ufshcd_uic_hibern8_exit(hba);
 			return err;
 		}
@@ -2269,7 +2310,7 @@ static void ufs_qcom_config_scaling_param(struct ufs_hba *hba,
 	p->polling_ms = 60;
 	p->timer = DEVFREQ_TIMER_DELAYED;
 	d->upthreshold = 70;
-	d->downdifferential = 5;
+	d->downdifferential = 65;
 
 	hba->clk_scaling.suspend_on_no_request = true;
 }
