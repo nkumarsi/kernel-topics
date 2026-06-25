@@ -562,6 +562,12 @@ static void fastrpc_context_free(struct kref *ref)
 	cctx = ctx->cctx;
 	fl = ctx->fl;
 
+	/* Remove from fl->interrupted if ERESTARTSYS; no-op for normal paths. */
+	spin_lock(&fl->lock);
+	if (!list_empty(&ctx->node))
+		list_del_init(&ctx->node);
+	spin_unlock(&fl->lock);
+
 	for (i = 0; i < ctx->nbufs; i++)
 		fastrpc_map_put(ctx->maps[i]);
 
@@ -605,6 +611,11 @@ static void fastrpc_context_save_interrupted(struct fastrpc_invoke_ctx *ctx)
 	list_del(&ctx->node);
 	list_add_tail(&ctx->node, &ctx->fl->interrupted);
 	spin_unlock(&ctx->fl->lock);
+	/*
+	 * invoke_send bumped the kref to 2; bail skips the put for ERESTARTSYS.
+	 * Drop it here so the worker's put reaches 0 and triggers context_free.
+	 */
+	fastrpc_context_put(ctx);
 }
 
 static struct fastrpc_invoke_ctx *fastrpc_context_restore_interrupted(
@@ -1340,10 +1351,9 @@ wait:
 bail:
 	if (ctx && err == -ERESTARTSYS) {
 		fastrpc_context_save_interrupted(ctx);
-	} else if (ctx && err != -ETIMEDOUT) {
-		/* We are done with this compute context */
+	} else if (ctx) {
 		spin_lock(&fl->lock);
-		list_del(&ctx->node);
+		list_del_init(&ctx->node);
 		spin_unlock(&fl->lock);
 		fastrpc_context_put(ctx);
 	}
