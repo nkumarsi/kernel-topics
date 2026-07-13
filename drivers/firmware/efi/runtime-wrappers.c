@@ -224,7 +224,7 @@ extern struct semaphore __efi_uv_runtime_lock __alias(efi_runtime_lock);
  * have been disabled and its efi_rts_work is abandoned. Loop in schedule()
  * so a spurious wakeup cannot resume it.
  */
-void efi_rts_park_worker(void)
+void __noreturn efi_rts_park_worker(void)
 {
 	for (;;) {
 		set_current_state(TASK_IDLE);
