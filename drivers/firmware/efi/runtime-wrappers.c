@@ -210,7 +210,7 @@ void efi_call_virt_check_flags(unsigned long flags, const void *caller)
  */
 static DEFINE_SEMAPHORE(efi_runtime_lock, 1);
 
-static struct task_struct *efi_runtime_lock_owner;
+static struct task_struct *efi_runtime_lock_owner __used;
 
 /*
  * Expose the EFI runtime lock to the UV platform
