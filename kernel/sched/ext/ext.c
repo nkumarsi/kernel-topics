@@ -20,6 +20,7 @@
 #include "arena.h"
 #include "idle.h"
 #include "sub.h"
+#include "inlines.h"
 
 DEFINE_RAW_SPINLOCK(scx_sched_lock);
 
@@ -4888,7 +4889,7 @@ static void scx_sched_free_rcu_work(struct work_struct *work)
 		 */
 		WARN_ON_ONCE(!list_empty(&pcpu->deferred_reenq_local.node));
 
-		/* retire the queued ecaps syncs so the pcpu can be freed */
+		/* remove the queued ecaps sync so the pcpu can be freed */
 		scx_discard_ecaps_to_sync(cpu, pcpu);
 
 		/*
@@ -4930,6 +4931,10 @@ static void scx_sched_free_rcu_work(struct work_struct *work)
 	scx_arena_pool_destroy(sch);
 	if (sch->arena_map)
 		bpf_map_put(sch->arena_map);
+
+	/* @sch is completely inactive by now */
+	scx_dec_has_subs(sch);
+
 	kfree(sch);
 }
 

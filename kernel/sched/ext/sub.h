@@ -11,7 +11,6 @@
 #define _KERNEL_SCHED_EXT_SUB_H
 
 #include "internal.h"
-#include "cid.h"
 
 #ifdef CONFIG_EXT_SUB_SCHED
 
@@ -45,6 +44,13 @@ static inline const char *sch_cgrp_path(struct scx_sched *sch)
 	return sch->cgrp_path;
 }
 
+/* a dying sub's hot-path influence ends in scx_sched_free_rcu_work() */
+static inline void scx_dec_has_subs(struct scx_sched *sch)
+{
+	if (sch->level)
+		static_branch_dec(&__scx_has_subs);
+}
+
 #else	/* CONFIG_EXT_SUB_SCHED */
 
 static inline struct scx_sched *scx_next_descendant_pre(struct scx_sched *pos, struct scx_sched *root) { return pos ? NULL : root; }
@@ -67,6 +73,7 @@ static inline void scx_discard_stale_ecaps_syncs(void) {}
 static inline struct scx_dispatch_q *scx_local_or_reject_dsq(struct scx_sched *sch, struct rq *rq, struct task_struct *p, u64 *enq_flags) { return &rq->scx.local_dsq; }
 static inline bool scx_task_reenq_on_cap_revoke(struct rq *rq, struct task_struct *p) { return false; }
 static inline void scx_reenq_reject(struct rq *rq) {}
+static inline void scx_dec_has_subs(struct scx_sched *sch) {}
 
 #endif	/* CONFIG_EXT_SUB_SCHED */
 
@@ -96,6 +103,10 @@ static inline void scx_reenq_reject(struct rq *rq) {}
 static inline u64 scx_missing_caps(struct scx_sched *sch, s32 cpu, u64 needed)
 {
 	u64 ecaps;
+
+	/* no sub-scheds, no missing caps */
+	if (!scx_has_subs())
+		return 0;
 
 	/* root holds every cap on every cpu */
 	if (!sch->level)
@@ -157,6 +168,9 @@ static inline u64 scx_caps_implied(u64 cap)
 /* may @p keep running on @rq's cpu? requires baseline cpu access */
 static inline bool scx_task_can_stay_on_cpu(struct rq *rq, struct task_struct *p)
 {
+	if (!scx_has_subs())
+		return true;
+
 	/* a migration-disabled task is let in without caps, keep it likewise */
 	if (unlikely(is_migration_disabled(p)))
 		return true;
@@ -171,114 +185,5 @@ static inline u64 scx_caps_for_preempt(struct scx_sched *sch, struct rq *rq) { r
 static inline bool scx_task_can_stay_on_cpu(struct rq *rq, struct task_struct *p) { return true; }
 
 #endif	/* CONFIG_EXT_SUB_SCHED */
-
-/*
- * One user of this function is scx_bpf_dispatch() which can be called
- * recursively as sub-sched dispatches nest. Always inline to reduce stack usage
- * from the call frame.
- */
-static __always_inline bool
-scx_dispatch_sched(struct scx_sched *sch, struct rq *rq,
-		   struct task_struct *prev, bool nested)
-{
-	struct scx_dsp_ctx *dspc = &this_cpu_ptr(sch->pcpu)->dsp_ctx;
-	int nr_loops = SCX_DSP_MAX_LOOPS;
-	s32 cpu = cpu_of(rq);
-	bool prev_on_sch = (prev->sched_class == &ext_sched_class) &&
-		scx_task_on_sched(sch, prev);
-
-	if (scx_consume_global_dsq(sch, rq))
-		return true;
-
-	if (scx_bypass_dsp_enabled(sch)) {
-		/* if @sch is bypassing, only the bypass DSQs are active */
-		if (scx_bypassing(sch, cpu))
-			return scx_consume_dispatch_q(sch, rq, scx_bypass_dsq(sch, cpu), 0);
-
-#ifdef CONFIG_EXT_SUB_SCHED
-		/*
-		 * If @sch isn't bypassing but its children are, @sch is
-		 * responsible for making forward progress for both its own
-		 * tasks that aren't bypassing and the bypassing descendants'
-		 * tasks. The following implements a simple built-in behavior -
-		 * let each CPU try to run the bypass DSQ every Nth time.
-		 *
-		 * Later, if necessary, we can add an ops flag to suppress the
-		 * auto-consumption and a kfunc to consume the bypass DSQ and,
-		 * so that the BPF scheduler can fully control scheduling of
-		 * bypassed tasks.
-		 */
-		struct scx_sched_pcpu *pcpu = per_cpu_ptr(sch->pcpu, cpu);
-
-		if (!(pcpu->bypass_host_seq++ % SCX_BYPASS_HOST_NTH) &&
-		    scx_consume_dispatch_q(sch, rq, scx_bypass_dsq(sch, cpu), 0)) {
-			__scx_add_event(sch, SCX_EV_SUB_BYPASS_DISPATCH, 1);
-			return true;
-		}
-#endif	/* CONFIG_EXT_SUB_SCHED */
-	}
-
-	if (unlikely(!SCX_HAS_OP(sch, dispatch)) || !scx_rq_online(rq))
-		return false;
-
-	dspc->rq = rq;
-
-	/*
-	 * The dispatch loop. Because scx_flush_dispatch_buf() may drop the rq
-	 * lock, the local DSQ might still end up empty after a successful
-	 * ops.dispatch(). If the local DSQ is empty even after ops.dispatch()
-	 * produced some tasks, retry. The BPF scheduler may depend on this
-	 * looping behavior to simplify its implementation.
-	 */
-	do {
-		dspc->nr_tasks = 0;
-
-		if (nested) {
-			SCX_CALL_OP(sch, dispatch, rq, scx_cpu_arg(cpu),
-				    prev_on_sch ? prev : NULL);
-		} else {
-			/* stash @prev so that nested invocations can access it */
-			rq->scx.sub_dispatch_prev = prev;
-			SCX_CALL_OP(sch, dispatch, rq, scx_cpu_arg(cpu),
-				    prev_on_sch ? prev : NULL);
-			rq->scx.sub_dispatch_prev = NULL;
-		}
-
-		scx_flush_dispatch_buf(sch, rq);
-
-		if ((prev->scx.flags & SCX_TASK_QUEUED) && prev->scx.slice) {
-			rq->scx.flags |= SCX_RQ_BAL_KEEP;
-			return true;
-		}
-		if (rq->scx.local_dsq.nr)
-			return true;
-		if (scx_consume_global_dsq(sch, rq))
-			return true;
-
-		/*
-		 * ops.dispatch() can trap us in this loop by repeatedly
-		 * dispatching ineligible tasks. Break out once in a while to
-		 * allow the watchdog to run. As IRQ can't be enabled in
-		 * balance(), we want to complete this scheduling cycle and then
-		 * start a new one. IOW, we want to call resched_curr() on the
-		 * next, most likely idle, task, not the current one. Use
-		 * __scx_bpf_kick_cpu() for deferred kicking.
-		 */
-		if (unlikely(!--nr_loops)) {
-			scx_kick_cpu(sch, cpu, 0);
-			break;
-		}
-	} while (dspc->nr_tasks);
-
-	/*
-	 * Prevent the CPU from going idle while bypassed descendants have tasks
-	 * queued. Without this fallback, bypassed tasks could stall if the host
-	 * scheduler's ops.dispatch() doesn't yield any tasks.
-	 */
-	if (scx_bypass_dsp_enabled(sch))
-		return scx_consume_dispatch_q(sch, rq, scx_bypass_dsq(sch, cpu), 0);
-
-	return false;
-}
 
 #endif /* _KERNEL_SCHED_EXT_SUB_H */
