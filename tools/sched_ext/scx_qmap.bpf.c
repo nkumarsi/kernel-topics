@@ -888,6 +888,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(qmap_init_task, struct task_struct *p,
 	struct task_ctx_stor_val *v;
 	task_ctx_t *taskc;
 
+	if (qa.inject_mode == QMAP_INJ_INIT_FAIL &&
+	    !bpf_strncmp(p->comm, 6, "qmfail"))
+		return -ENOMEM;
+
 	if (p->tgid == disallow_tgid)
 		p->scx.disallow = true;
 
@@ -1010,27 +1014,68 @@ void BPF_STRUCT_OPS(qmap_dump_task, struct scx_dump_ctx *dctx, struct task_struc
 		     taskc->force_local, taskc->core_sched_seq);
 }
 
-s32 BPF_STRUCT_OPS(qmap_cgroup_init, struct cgroup *cgrp, struct scx_cgroup_init_args *args)
+s32 BPF_STRUCT_OPS(qmap_cpuctl_init, struct cgroup *cgrp, struct scx_cgroup_init_args *args)
 {
+	QMAP_TOUCH_ARENA();
+
 	if (print_msgs)
 		bpf_printk("CGRP INIT %llu weight=%u period=%lu quota=%ld burst=%lu",
 			   cgrp->kn->id, args->weight, args->bw_period_us,
 			   args->bw_quota_us, args->bw_burst_us);
+
+	if (qa.inject_mode == QMAP_INJ_CGRP_INIT_FAIL) {
+		char name[7] = {};
+
+		bpf_probe_read_kernel_str(name, sizeof(name), cgrp->kn->name);
+		if (!bpf_strncmp(name, 6, "qmfail"))
+			return -ENOMEM;
+	}
+
 	return 0;
 }
 
-void BPF_STRUCT_OPS(qmap_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
+static void redistribute(void);
+
+void BPF_STRUCT_OPS(qmap_cpuctl_set_weight, struct cgroup *cgrp, u32 weight)
 {
+	u64 cgid = cgrp->kn->id;
+	s32 i;
+
+	QMAP_TOUCH_ARENA();
+
 	if (print_msgs)
-		bpf_printk("CGRP SET %llu weight=%u", cgrp->kn->id, weight);
+		bpf_printk("CGRP SET %llu weight=%u", cgid, weight);
+
+	/*
+	 * Knobs belong to the parent, so this op carries the child subs'
+	 * attach point weights. Adjust the matching sub's share of the cid
+	 * partition. Other cgroups don't participate in the split.
+	 */
+	for (i = 0; i < MAX_SUB_SCHEDS; i++) {
+		if (qa.sub_sched_ctxs[i].cgroup_id != cgid)
+			continue;
+		if (qa.sub_sched_ctxs[i].weight != weight) {
+			qa.sub_sched_ctxs[i].weight = weight;
+			redistribute();
+		}
+		break;
+	}
 }
 
-void BPF_STRUCT_OPS(qmap_cgroup_set_bandwidth, struct cgroup *cgrp,
-		    u64 period_us, u64 quota_us, u64 burst_us)
+void BPF_STRUCT_OPS(qmap_cpuctl_set_bandwidth, struct cgroup *cgrp, u64 period_us,
+		    u64 quota_us, u64 burst_us)
 {
 	if (print_msgs)
 		bpf_printk("CGRP SET %llu period=%lu quota=%ld burst=%lu",
 			   cgrp->kn->id, period_us, quota_us, burst_us);
+}
+
+void BPF_STRUCT_OPS(qmap_cpuctl_move, struct task_struct *p, struct cgroup *from,
+		    struct cgroup *to)
+{
+	if (print_msgs)
+		bpf_printk("CGRP MOVE %d %llu -> %llu",
+			   p->pid, from->kn->id, to->kn->id);
 }
 
 void BPF_STRUCT_OPS(qmap_update_idle, s32 cid, bool idle)
@@ -1336,10 +1381,12 @@ __noinline void compute_partition(void)
 	}
 
 	/*
-	 * Snapshot membership and weights so the sum_w and share loops agree.
-	 * A mid-compute change would otherwise wrap nr_shared negative.
+	 * Snapshot membership and weights so the sum_w and share loops agree. A
+	 * mid-compute change would otherwise wrap nr_shared negative. The self
+	 * weight is fixed at the default: a cgroup's weight is its parent's
+	 * knob, not the scheduler's own business.
 	 */
-	self_w = qa.self_weight ?: 100;
+	self_w = 100;
 	bpf_for(i, 0, MAX_SUB_SCHEDS) {
 		cgid_snap[i] = qa.sub_sched_ctxs[i].cgroup_id;
 		w_snap[i] = cgid_snap[i] ? (qa.sub_sched_ctxs[i].weight ?: 100) : 0;
@@ -1565,7 +1612,7 @@ __noinline void apply_partition(void)
 
 /*
  * Recompute the split off the node's held caps and apply it. The contexts this
- * runs from (the sub-sched callbacks, the userspace poke, the rr timer) are not
+ * runs from (the sub-sched and cgroup callbacks, the rr timer) are not
  * serialized by the kernel, so a single runner does the work. A caller that
  * finds the guard held leaves part_pending set; the holder drains it before
  * releasing, with the rr timer as a backstop.
@@ -1590,14 +1637,6 @@ static void redistribute(void)
 	}
 
 	part_end();
-}
-
-/* userspace pokes this (PROG_RUN) to resplit after a cpu.weight change */
-SEC("syscall")
-int repartition(void *ctx)
-{
-	redistribute();
-	return 0;
 }
 
 /*
@@ -1849,6 +1888,33 @@ void BPF_STRUCT_OPS(qmap_exit, struct scx_exit_info *ei)
 	UEI_RECORD(uei, ei);
 }
 
+/*
+ * Seed a new sub slot with the cgroup's current weight. The kernel delivers
+ * ops.cpuctl_set_weight() only on value-changing writes, so a weight set
+ * before the sub attached would otherwise go unnoticed.
+ */
+static u32 cgrp_cur_weight(u64 cgid)
+{
+	struct cgroup_subsys_state *css;
+	struct cgroup *cgrp;
+	u32 weight = 100;
+
+	cgrp = bpf_cgroup_from_id(cgid);
+	if (!cgrp)
+		return weight;
+
+	css = BPF_CORE_READ(cgrp, subsys[cpu_cgrp_id]);
+	if (css) {
+		struct task_group *tg = container_of(css, struct task_group, css);
+		u32 w = BPF_CORE_READ(tg, scx.weight);
+
+		if (w)
+			weight = w;
+	}
+	bpf_cgroup_release(cgrp);
+	return weight;
+}
+
 s32 BPF_STRUCT_OPS(qmap_sub_attach, struct scx_sub_attach_args *args)
 {
 	s32 i;
@@ -1862,7 +1928,7 @@ s32 BPF_STRUCT_OPS(qmap_sub_attach, struct scx_sub_attach_args *args)
 			continue;
 
 		qa.sub_sched_ctxs[i].cgroup_id = args->ops->sub_cgroup_id;
-		qa.sub_sched_ctxs[i].weight = 100;	/* until userspace feeds it */
+		qa.sub_sched_ctxs[i].weight = cgrp_cur_weight(args->ops->sub_cgroup_id);
 		qa.nr_sub_scheds++;
 		bpf_printk("attaching sub-sched[%d] on %s", i, args->cgroup_path);
 		redistribute();
@@ -1923,9 +1989,10 @@ SCX_OPS_CID_DEFINE(qmap_ops,
 	       .dump			= (void *)qmap_dump,
 	       .dump_cid		= (void *)qmap_dump_cid,
 	       .dump_task		= (void *)qmap_dump_task,
-	       .cgroup_init		= (void *)qmap_cgroup_init,
-	       .cgroup_set_weight	= (void *)qmap_cgroup_set_weight,
-	       .cgroup_set_bandwidth	= (void *)qmap_cgroup_set_bandwidth,
+	       .cpuctl_init		= (void *)qmap_cpuctl_init,
+	       .cpuctl_set_weight	= (void *)qmap_cpuctl_set_weight,
+	       .cpuctl_set_bandwidth	= (void *)qmap_cpuctl_set_bandwidth,
+	       .cpuctl_move		= (void *)qmap_cpuctl_move,
 	       .sub_attach		= (void *)qmap_sub_attach,
 	       .sub_detach		= (void *)qmap_sub_detach,
 	       .sub_caps_updated	= (void *)qmap_sub_caps_updated,

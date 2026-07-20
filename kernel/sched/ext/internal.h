@@ -645,8 +645,19 @@ struct sched_ext_ops {
 	 * @cgrp: cgroup being initialized
 	 * @args: init arguments, see the struct definition
 	 *
-	 * Either the BPF scheduler is being loaded or @cgrp created, initialize
-	 * @cgrp for sched_ext. This operation may block.
+	 * Initialize @cgrp for sched_ext, delivered to @cgrp's sched either
+	 * when the BPF scheduler is being loaded or when @cgrp is created. This
+	 * operation may block.
+	 *
+	 * Cgroup handovers also generate these ops: an enabling sub-scheduler
+	 * receives ops.cgroup_init() for every cgroup in its subtree while the
+	 * previous sched receives ops.cgroup_exit(), and disabling reverses the
+	 * two.
+	 *
+	 * When the BPF scheduler is being loaded or cgroups are being handed
+	 * over, @cgrp may already have been removed by userspace: a removed
+	 * cgroup stays schedulable until its dying tasks finish their final
+	 * context switches.
 	 *
 	 * Return 0 for success, -errno for failure. An error return while
 	 * loading will abort loading of the BPF scheduler. During cgroup
@@ -659,8 +670,13 @@ struct sched_ext_ops {
 	 * @cgroup_exit: Exit a cgroup
 	 * @cgrp: cgroup being exited
 	 *
-	 * Either the BPF scheduler is being unloaded or @cgrp destroyed, exit
-	 * @cgrp for sched_ext. This operation my block.
+	 * Exit @cgrp for sched_ext, delivered to the sched whose
+	 * ops.cgroup_init() it pairs with, either when the BPF scheduler is
+	 * being unloaded or when @cgrp is destroyed. This operation may block.
+	 *
+	 * For a destroyed @cgrp, delivery follows the last scheduling event on
+	 * it: a removed cgroup stays schedulable until its dying tasks finish
+	 * their final context switches.
 	 */
 	void (*cgroup_exit)(struct cgroup *cgrp);
 
@@ -672,6 +688,12 @@ struct sched_ext_ops {
 	 *
 	 * Prepare @p for move from cgroup @from to @to. This operation may
 	 * block and can be used for allocations.
+	 *
+	 * The cgroup_move ops are delivered to @p's sched, and only for moves
+	 * that don't re-home @p. A re-homing move is reported through
+	 * ops.exit_task() and ops.init_task() instead. @from and @to can
+	 * reference cgroups the sched never received ops.cgroup_init() for, as
+	 * the cpu controller can be coarser than the sub-scheduler topology.
 	 *
 	 * Return 0 for success, -errno for failure. An error return aborts the
 	 * migration.
@@ -708,6 +730,11 @@ struct sched_ext_ops {
 	 * @weight: new weight [1..10000]
 	 *
 	 * Update @cgrp's weight to @weight.
+	 *
+	 * Knobs of a cgroup belong to the parent, so the set_* ops are
+	 * delivered to @cgrp's parent's sched. That sched may never have seen
+	 * ops.cgroup_init() for @cgrp - at a sub-scheduler attach point, the
+	 * parent sched tracks @cgrp through ops.sub_attach() instead.
 	 */
 	void (*cgroup_set_weight)(struct cgroup *cgrp, u32 weight);
 
@@ -728,6 +755,8 @@ struct sched_ext_ops {
 	 * burst temporarily. The specific control mechanism and thus the
 	 * interpretation of @period_us and burstiness is up to the BPF
 	 * scheduler.
+	 *
+	 * Delivery follows the same rule as cgroup_set_weight().
 	 */
 	void (*cgroup_set_bandwidth)(struct cgroup *cgrp,
 				     u64 period_us, u64 quota_us, u64 burst_us);
@@ -740,6 +769,8 @@ struct sched_ext_ops {
 	 * Update @cgrp's idle state to @idle. This callback is invoked when
 	 * a cgroup transitions between idle and non-idle states, allowing the
 	 * BPF scheduler to adjust its behavior accordingly.
+	 *
+	 * Delivery follows the same rule as cgroup_set_weight().
 	 */
 	void (*cgroup_set_idle)(struct cgroup *cgrp, bool idle);
 
@@ -961,6 +992,7 @@ struct sched_ext_ops {
  *   - cpu_online       -> cid_online
  *   - cpu_offline      -> cid_offline
  *   - dump_cpu         -> dump_cid
+ *   - cgroup_*         -> cpuctl_* (they track the cgroup cpu controller)
  *   - cpu_acquire/cpu_release  -> not present (deprecated in sched_ext_ops)
  *
  * BPF schedulers using this type cannot call cpu-form scx_bpf_* kfuncs;
@@ -996,19 +1028,17 @@ struct sched_ext_ops_cid {
 	void (*dump_cid)(struct scx_dump_ctx *ctx, s32 cid, bool idle);
 	void (*dump_task)(struct scx_dump_ctx *ctx, struct task_struct *p);
 #ifdef CONFIG_EXT_GROUP_SCHED
-	s32 (*cgroup_init)(struct cgroup *cgrp,
-			    struct scx_cgroup_init_args *args);
-	void (*cgroup_exit)(struct cgroup *cgrp);
-	s32 (*cgroup_prep_move)(struct task_struct *p,
-				 struct cgroup *from, struct cgroup *to);
-	void (*cgroup_move)(struct task_struct *p,
-			     struct cgroup *from, struct cgroup *to);
-	void (*cgroup_cancel_move)(struct task_struct *p,
-				    struct cgroup *from, struct cgroup *to);
-	void (*cgroup_set_weight)(struct cgroup *cgrp, u32 weight);
-	void (*cgroup_set_bandwidth)(struct cgroup *cgrp,
-				      u64 period_us, u64 quota_us, u64 burst_us);
-	void (*cgroup_set_idle)(struct cgroup *cgrp, bool idle);
+	s32 (*cpuctl_init)(struct cgroup *cgrp, struct scx_cgroup_init_args *args);
+	void (*cpuctl_exit)(struct cgroup *cgrp);
+	s32 (*cpuctl_prep_move)(struct task_struct *p, struct cgroup *from,
+				struct cgroup *to);
+	void (*cpuctl_move)(struct task_struct *p, struct cgroup *from, struct cgroup *to);
+	void (*cpuctl_cancel_move)(struct task_struct *p, struct cgroup *from,
+				   struct cgroup *to);
+	void (*cpuctl_set_weight)(struct cgroup *cgrp, u32 weight);
+	void (*cpuctl_set_bandwidth)(struct cgroup *cgrp, u64 period_us, u64 quota_us,
+				     u64 burst_us);
+	void (*cpuctl_set_idle)(struct cgroup *cgrp, bool idle);
 #endif	/* CONFIG_EXT_GROUP_SCHED */
 	s32 (*sub_attach)(struct scx_sub_attach_args *args);
 	void (*sub_detach)(struct scx_sub_detach_args *args);
@@ -1696,6 +1726,7 @@ enum scx_kick_flags {
 enum scx_tg_flags {
 	SCX_TG_ONLINE		= 1U << 0,
 	SCX_TG_INITED		= 1U << 1,
+	SCX_TG_SUB_INIT		= 1U << 2,	/* see scx_cgroup_claim_subtree() */
 };
 
 enum scx_enable_state {
@@ -1920,7 +1951,8 @@ void scx_flush_dispatch_buf(struct scx_sched *sch, struct rq *rq);
 void scx_kick_cpu(struct scx_sched *sch, s32 cpu, u64 flags);
 void schedule_dsq_reenq(struct scx_sched *sch, struct scx_dispatch_q *dsq,
 			u64 reenq_flags, struct rq *locked_rq);
-int __scx_init_task(struct scx_sched *sch, struct task_struct *p, bool fork);
+int __scx_init_task(struct scx_sched *sch, struct task_struct *p,
+		    struct cgroup *cgrp, bool fork);
 void scx_enable_task(struct scx_sched *sch, struct task_struct *p);
 void __scx_disable_and_exit_task(struct scx_sched *sch, struct task_struct *p);
 void scx_sub_init_cancel_task(struct scx_sched *sch, struct task_struct *p);
@@ -1949,6 +1981,7 @@ __printf(3, 0) s32 scx_bstr_format(struct scx_sched *sch, struct scx_bstr_buf *b
 extern raw_spinlock_t scx_sched_lock;
 extern struct mutex scx_enable_mutex;
 extern struct percpu_rw_semaphore scx_fork_rwsem;
+extern bool scx_cgroup_enabled;
 extern raw_spinlock_t scx_exit_bstr_buf_lock;
 extern struct scx_bstr_buf scx_exit_bstr_buf;
 #ifdef CONFIG_EXT_SUB_SCHED
